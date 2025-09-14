@@ -43,10 +43,10 @@ def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
 # ===== LOAD Q&A =====
 def load_qa(path: str):
     df = pd.read_excel(path)
-    df = df.rename(columns={"questions":"Question","answers":"Answer","Business":"Business"})
+  #  df = df.rename(columns={"questions":"Question","answers":"Answer","Business":"Business"})
     if "Business" not in df.columns:
         df["Business"] = ""
-    df["id"] = np.arange(len(df))
+    #df["id"] = np.arange(len(df))
     return df[["id","Question","Answer","Business"]]
 
 # ===== LOAD LAN STATUS =====
