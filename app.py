@@ -9,18 +9,20 @@ import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI, OpenAIError
 
-# ===================================
+# ==============================
 # Load Environment Variables
-# ===================================
+# ==============================
 load_dotenv()
 
-# Debug: Check API key is loaded
-st.write("🔹 Debug - Loaded API Key:", os.getenv("OPENAI_API_KEY"))
+st.title("NBFC Legal Advocate RAG Bot 🤖")
+
+# ---------- Debug API Key ----------
+st.write("Debug - Loaded API Key:", os.getenv("OPENAI_API_KEY"))
 
 # ---------- Fetch API Key ----------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    st.error("⚠️ OPENAI_API_KEY not found in .env or Streamlit Secrets!")
+    st.error("⚠️ OPENAI_API_KEY not found in .env file")
     st.stop()
 
 # ---------- Initialize OpenAI Client ----------
@@ -30,31 +32,30 @@ except OpenAIError as e:
     st.error(f"⚠️ Failed to initialize OpenAI client: {e}")
     st.stop()
 
-# ===================================
+# ==============================
 # Load File Paths
-# ===================================
-# Prefer Streamlit secrets for deployment
-LAN_DATA_PATH = st.secrets.get("LAN_DATA_PATH", os.getenv("LAN_DATA_PATH"))
-EXCEL_QA_PATH = st.secrets.get("EXCEL_QA_PATH", os.getenv("EXCEL_QA_PATH"))
-LOG_FILE = st.secrets.get("LOG_FILE", os.getenv("LOG_FILE", "error_log.txt"))
+# ==============================
+EXCEL_QA_PATH = os.getenv("EXCEL_QA_PATH")
+EXCEL_LAN_PATH = os.getenv("EXCEL_LAN_PATH")
+LOG_FILE = os.getenv("LOG_FILE", "error_log.txt")  # Default log file
 
 # Validate file paths
 if not EXCEL_QA_PATH or not os.path.exists(EXCEL_QA_PATH):
     st.error(f"⚠️ EXCEL_QA_PATH is missing or invalid: {EXCEL_QA_PATH}")
     st.stop()
 
-if not LAN_DATA_PATH or not os.path.exists(LAN_DATA_PATH):
-    st.warning(f"⚠️ LAN_DATA_PATH file not found: {LAN_DATA_PATH}")
-    LAN_DATA_PATH = None  # Continue gracefully
+if not EXCEL_LAN_PATH or not os.path.exists(EXCEL_LAN_PATH):
+    st.warning(f"⚠️ EXCEL_LAN_PATH file not found: {EXCEL_LAN_PATH}")
+    EXCEL_LAN_PATH = None  # Continue gracefully
 
 # Debug info
 st.write("✅ QA File Path Loaded:", EXCEL_QA_PATH)
-st.write("✅ LAN File Path Loaded:", LAN_DATA_PATH if LAN_DATA_PATH else "Not provided")
+st.write("✅ LAN File Path Loaded:", EXCEL_LAN_PATH if EXCEL_LAN_PATH else "Not provided")
 st.write("✅ Log File Path Loaded:", LOG_FILE)
 
-# ===================================
+# ==============================
 # Utility Functions
-# ===================================
+# ==============================
 def _norm(s: str) -> str:
     return str(s).strip().lower()
 
@@ -62,31 +63,40 @@ def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     denom = (np.linalg.norm(a) * np.linalg.norm(b))
     return float(np.dot(a, b) / denom) if denom else 0.0
 
-# ===================================
+# ==============================
 # Load Q&A Excel
-# ===================================
+# ==============================
 def load_qa(path: str):
     df = pd.read_excel(path)
-    df.rename(columns=lambda x: x.strip(), inplace=True)
 
-    if "Business" not in df.columns:
-        df["Business"] = ""
-    if "id" not in df.columns:
-        df["id"] = np.arange(len(df))
+    # Clean and normalize column names
+    df.columns = df.columns.str.strip()
+    df.columns = df.columns.str.replace(r"\s+", " ", regex=True)
 
-    # Expected columns: id, Question, Answer, Business
-    return df[["id", "Question", "Answer", "Business"]]
+    # Debugging step to display columns
+    st.write("Excel columns loaded after cleanup:", df.columns.tolist())
 
-# ===================================
-# Load LAN Data
-# ===================================
+    required_columns = {"id", "Business", "Question", "Answer"}
+    missing = required_columns - set(df.columns)
+    if missing:
+        st.error(f"Missing required columns in QA file: {missing}")
+        st.stop()
+
+    return df[["id", "Business", "Question", "Answer"]]
+
+# ==============================
+# Load LAN Status Excel
+# ==============================
 def load_lan_status(path: str):
     if not path or not os.path.exists(path):
         return None
     df = pd.read_excel(path, dtype={"Lan Id": str})
-    df.rename(columns=lambda x: x.strip(), inplace=True)
+    df.columns = df.columns.str.strip()
 
-    # Clean data
+    if "Lan Id" not in df.columns or "Status" not in df.columns or "Business" not in df.columns:
+        st.error("LAN file must contain 'Lan Id', 'Status', and 'Business' columns.")
+        st.stop()
+
     df["Lan Id"] = df["Lan Id"].astype(str).str.strip()
     df["Status"] = df["Status"].astype(str).str.strip()
     df["Business"] = df["Business"].astype(str).str.strip()
@@ -94,9 +104,9 @@ def load_lan_status(path: str):
 
     return df
 
-# ===================================
-# Embeddings Logic
-# ===================================
+# ==============================
+# Embeddings
+# ==============================
 EMBED_CACHE = "qa_embeddings.pkl"
 EMBED_MODEL = "text-embedding-3-small"
 TOP_K = 5
@@ -133,9 +143,9 @@ def build_or_load_embeddings(excel_path=EXCEL_QA_PATH, cache_path=EMBED_CACHE):
 
     return df, vecs
 
-# ===================================
-# Retrieve Relevant Context
-# ===================================
+# ==============================
+# RAG Retrieval
+# ==============================
 def retrieve(query, df, embeddings, top_k=TOP_K):
     """Retrieve top-k relevant Q&A entries for a query."""
     q_vecs = embed_texts([query])
@@ -155,23 +165,19 @@ def retrieve(query, df, embeddings, top_k=TOP_K):
         for i in top_idx
     ]
 
-# ===================================
-# Streamlit App
-# ===================================
-st.title("NBFC Legal Advocate RAG Bot 🤖")
-st.write("Ask about LAN status, notices, or general legal queries!")
-
-# Load data
+# ==============================
+# Load data once
+# ==============================
 qa_df, qa_embeddings = build_or_load_embeddings(EXCEL_QA_PATH)
-lan_df = load_lan_status(LAN_DATA_PATH)
+lan_df = load_lan_status(EXCEL_LAN_PATH)
 
-# ===================================
-# User Query Section
-# ===================================
+# ==============================
+# User Input
+# ==============================
 query = st.text_input("Enter your query:")
 
 if query:
-    # Check if query contains a LAN ID
+    # If query contains LAN ID
     lan_id_match = re.search(r"\b\d{3,}\b", query)
     if lan_id_match and lan_df is not None:
         lan_id = lan_id_match.group(0)
@@ -187,7 +193,7 @@ if query:
         else:
             st.warning(f"No LAN record found for {lan_id}")
     else:
-        # Regular RAG query
+        # Regular RAG search
         contexts = retrieve(query, qa_df, qa_embeddings)
         if contexts:
             context_text = "\n\n".join(
