@@ -18,8 +18,8 @@ st.write("Ask about LAN status, notices, or general legal queries!")
 # ==============================
 try:
     OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
-    EXCEL_QA_PATH = st.secrets["EXCEL_QA_PATH"]
-    EXCEL_LAN_PATH = st.secrets["EXCEL_LAN_PATH"]
+    EXCEL_QA_PATH = st.secrets.get("EXCEL_QA_PATH", "qa_data.xlsx")
+    EXCEL_LAN_PATH = st.secrets.get("EXCEL_LAN_PATH", "legal_staircase.xlsx")
     LOG_FILE = st.secrets.get("LOG_FILE", "error_log.txt")
 except KeyError as e:
     st.error(f"⚠️ Missing secret: {e}. Please add it under Streamlit Cloud → Settings → Secrets.")
@@ -67,7 +67,6 @@ def load_qa(path: str):
     df = pd.read_excel(path)
     st.write("🔹 QA Data Preview", df.head())
 
-    # Validate required columns
     required_columns = {"id", "Business", "Question", "Answer"}
     if not required_columns.issubset(set(df.columns)):
         missing = required_columns - set(df.columns)
@@ -98,7 +97,6 @@ def load_lan_status(path: str):
 # Embeddings
 # ==============================
 def embed_texts(texts):
-    """Generate embeddings for a list of texts"""
     vectors = []
     BATCH = 128
     for i in range(0, len(texts), BATCH):
@@ -115,8 +113,6 @@ def embed_texts(texts):
     return vectors
 
 def build_or_load_embeddings(excel_path=EXCEL_QA_PATH, cache_path=EMBED_CACHE):
-    """Build embeddings if cache doesn't exist or data has changed"""
-    # Always rebuild embeddings (delete old cache)
     if os.path.exists(cache_path):
         os.remove(cache_path)
         st.warning("🗑️ Old embedding cache deleted. Rebuilding from scratch...")
@@ -246,7 +242,6 @@ st.write("📊 Embeddings Count:", qa_embeddings.shape[0])
 query = st.text_input("Enter your query:")
 
 if query:
-    # Check if query has LAN ID
     lan_id_match = re.search(r"\b\d{3,}\b", query)
     if lan_id_match and lan_df is not None:
         lan_id = lan_id_match.group(0)
