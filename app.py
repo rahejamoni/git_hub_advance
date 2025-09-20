@@ -10,19 +10,16 @@ from openai import OpenAI, OpenAIError
 # ==============================
 # Streamlit App Title
 # ==============================
+st.set_page_config(page_title="NBFC Legal Advocate RAG Bot", layout="wide")
 st.title("NBFC Legal Advocate RAG Bot 🤖")
 st.write("Ask about LAN status, notices, or general legal queries!")
 
 # ==============================
-# Load Secrets (Streamlit Cloud → Settings → Secrets)
+# Load Secrets
 # ==============================
-try:
-    OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
-    EXCEL_QA_PATH = st.secrets.get("EXCEL_QA_PATH", "qa_data.xlsx")
-    EXCEL_LAN_PATH = st.secrets.get("EXCEL_LAN_PATH", "legal_staircase.xlsx")
-    LOG_FILE = st.secrets.get("LOG_FILE", "error_log.txt")
-except KeyError as e:
-    st.error(f"⚠️ Missing secret: {e}. Please add it under Streamlit Cloud → Settings → Secrets.")
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", None)
+if not OPENAI_API_KEY:
+    st.error("⚠️ Please add OPENAI_API_KEY in Streamlit Secrets.")
     st.stop()
 
 # ---------- Initialize OpenAI Client ----------
@@ -56,115 +53,100 @@ def _truncate_to_words(text: str, max_words: int = MAX_WORDS) -> str:
     return " ".join(words[:max_words])
 
 def log_error(msg: str):
-    with open(LOG_FILE, "a") as f:
+    with open("error_log.txt", "a") as f:
         f.write(msg + "\n")
+
+# ==============================
+# File Upload (Streamlit Cloud compatible)
+# ==============================
+st.sidebar.header("Upload Excel Files (optional)")
+qa_file = st.sidebar.file_uploader("Upload QA Excel", type=["xlsx"])
+lan_file = st.sidebar.file_uploader("Upload LAN Excel", type=["xlsx"])
 
 # ==============================
 # Load QA & LAN Data
 # ==============================
-def load_qa(path: str):
-    st.write(f"📂 Loading QA Excel file: {path}")
-    df = pd.read_excel(path)
-    st.write("🔹 QA Data Preview", df.head())
-
+@st.cache_data
+def load_qa(file):
+    df = pd.read_excel(file)
     required_columns = {"id", "Business", "Question", "Answer"}
-    if not required_columns.issubset(set(df.columns)):
+    if not required_columns.issubset(df.columns):
         missing = required_columns - set(df.columns)
-        st.error(f"❌ Missing required QA columns: {missing}")
+        st.error(f"❌ Missing QA columns: {missing}")
         st.stop()
-
     return df[["id", "Business", "Question", "Answer"]]
 
-def load_lan_status(path: str):
-    st.write(f"📂 Loading LAN Excel file: {path}")
-    df = pd.read_excel(path, dtype={"Lan Id": str})
+@st.cache_data
+def load_lan(file):
+    df = pd.read_excel(file, dtype={"Lan Id": str})
     df.columns = df.columns.str.strip()
-
     required_columns = {"Lan Id", "Status", "Business", "Notice Sent Date"}
-    if not required_columns.issubset(set(df.columns)):
-        st.error(f"❌ LAN file must have columns: {required_columns}")
+    if not required_columns.issubset(df.columns):
+        st.error(f"❌ LAN file missing columns: {required_columns}")
         st.stop()
-
     df["Lan Id"] = df["Lan Id"].astype(str).str.strip()
     df["Status"] = df["Status"].astype(str).str.strip()
     df["Business"] = df["Business"].astype(str).str.strip()
     df["Notice Sent Date"] = pd.to_datetime(df["Notice Sent Date"], dayfirst=True, errors="coerce")
-
-    st.write("🔹 LAN Data Preview", df.head())
     return df
+
+# Use uploaded files or default placeholders
+qa_df = load_qa(qa_file) if qa_file else None
+lan_df = load_lan(lan_file) if lan_file else None
 
 # ==============================
 # Embeddings
 # ==============================
+@st.cache_data(show_spinner=False)
 def embed_texts(texts):
     vectors = []
     BATCH = 128
     for i in range(0, len(texts), BATCH):
         batch = texts[i:i + BATCH]
-        st.write(f"🔹 Generating embeddings for batch size: {len(batch)}")
         try:
             resp = client.embeddings.create(model=EMBED_MODEL, input=batch)
-            st.write("✅ Embedding API Response Received")
             vectors.extend([d.embedding for d in resp.data])
         except OpenAIError as e:
-            st.error(f"⚠️ OpenAI Embedding API failed: {e}")
+            st.error(f"Embedding API failed: {e}")
             log_error(f"Embedding API Error: {e}")
             return []
     return vectors
 
-def build_or_load_embeddings(excel_path=EXCEL_QA_PATH, cache_path=EMBED_CACHE):
-    if os.path.exists(cache_path):
-        os.remove(cache_path)
-        st.warning("🗑️ Old embedding cache deleted. Rebuilding from scratch...")
-
-    df = load_qa(excel_path)
-
-    if len(df) == 0:
-        st.error("❌ QA file has no data.")
-        return df, np.array([])
-
+@st.cache_data(show_spinner=True)
+def build_embeddings(df):
     corpus = [f"Business: {b}\nQ: {q}\nA: {a}" for q, a, b in zip(df["Question"], df["Answer"], df["Business"])]
     vecs = np.array(embed_texts(corpus), dtype=np.float32)
+    return vecs
 
-    if vecs.shape[0] == 0:
-        st.error("❌ No embeddings generated. Check API key and data validity.")
-        return df, np.array([])
-
-    with open(cache_path, "wb") as f:
-        pickle.dump({"df": df, "embeddings": vecs, "csv_len": len(df)}, f)
-
-    st.success(f"✅ Embeddings built successfully! Total records: {len(df)}")
-    return df, vecs
+if qa_df is not None:
+    if os.path.exists(EMBED_CACHE):
+        with open(EMBED_CACHE, "rb") as f:
+            cache = pickle.load(f)
+            qa_embeddings = cache["embeddings"]
+    else:
+        qa_embeddings = build_embeddings(qa_df)
+        with open(EMBED_CACHE, "wb") as f:
+            pickle.dump({"df": qa_df, "embeddings": qa_embeddings}, f)
 
 # ==============================
 # RAG Retrieval
 # ==============================
 def retrieve(query, df, embeddings, top_k=TOP_K):
     if embeddings.shape[0] == 0:
-        st.error("⚠️ No QA embeddings available. Please rebuild.")
         return []
-
     q_vecs = embed_texts([query])
     if not q_vecs:
         return []
-
     q_vec = np.array(q_vecs[0], dtype=np.float32)
     sims = np.array([_cosine_sim(q_vec, emb) for emb in embeddings])
     top_idx = sims.argsort()[::-1][:top_k]
-
     return [
-        {
-            "id": int(df.iloc[i]["id"]),
-            "Question": df.iloc[i]["Question"],
-            "Answer": df.iloc[i]["Answer"],
-            "Business": df.iloc[i]["Business"],
-            "Score": float(sims[i]),
-        }
+        {"id": int(df.iloc[i]["id"]), "Question": df.iloc[i]["Question"], "Answer": df.iloc[i]["Answer"], "Business": df.iloc[i]["Business"], "Score": float(sims[i])}
         for i in top_idx
     ]
 
 # ==============================
-# LLM Answer Generation
+# LLM Answer
 # ==============================
 SYSTEM_ROLE = (
     "You are a Senior Legal Advocate with 15 years of experience advising NBFCs. "
@@ -175,26 +157,19 @@ SYSTEM_ROLE = (
 def llm_answer(query, contexts):
     if not contexts:
         return "No relevant context found."
-
     context_text = "\n\n".join([f"[DOC {c['id']}] Q: {c['Question']}\nA: {c['Answer']}" for c in contexts])
     user_prompt = f"User Query:\n{query}\n\nRetrieved Context:\n{context_text}\n\nAnswer in ≤{MAX_WORDS} words."
-
     try:
         resp = client.chat.completions.create(
             model=CHAT_MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_ROLE},
-                {"role": "user", "content": user_prompt}
-            ],
+            messages=[{"role": "system", "content": SYSTEM_ROLE}, {"role": "user", "content": user_prompt}],
             temperature=0.2,
             max_tokens=220
         )
         text = resp.choices[0].message.content.strip()
-        if len(text.split()) > MAX_WORDS:
-            text = _truncate_to_words(text, MAX_WORDS)
-        return text
+        return _truncate_to_words(text)
     except OpenAIError as e:
-        st.error(f"⚠️ OpenAI LLM call failed: {e}")
+        st.error(f"LLM API call failed: {e}")
         log_error(f"LLM API Error: {e}")
         return "LLM call failed."
 
@@ -210,16 +185,12 @@ STAIRCASE_OFFSETS = {
     "post sales": ("Closure", 5),
 }
 
-LEGAL_INITIATED_STATUSES = {
-    "pre arbitration notice", "arbitration notice",
-    "arbitral award", "execution notice", "reminder notice"
-}
+LEGAL_INITIATED_STATUSES = {"pre arbitration notice", "arbitration notice", "arbitral award", "execution notice", "reminder notice"}
 
 def summarize_lan_record(row):
     last_status = row["Status"]
     last_date = row["Notice Sent Date"]
     next_name, next_offset = STAIRCASE_OFFSETS.get(_norm(last_status), (None, None))
-
     return {
         "lan_id": row["Lan Id"],
         "business": row["Business"],
@@ -231,14 +202,8 @@ def summarize_lan_record(row):
     }
 
 # ==============================
-# Main Logic
+# Main App Logic
 # ==============================
-qa_df, qa_embeddings = build_or_load_embeddings(EXCEL_QA_PATH)
-lan_df = load_lan_status(EXCEL_LAN_PATH)
-
-st.write("📊 QA Records Loaded:", len(qa_df))
-st.write("📊 Embeddings Count:", qa_embeddings.shape[0])
-
 query = st.text_input("Enter your query:")
 
 if query:
@@ -246,11 +211,9 @@ if query:
     if lan_id_match and lan_df is not None:
         lan_id = lan_id_match.group(0)
         subset = lan_df[lan_df["Lan Id"].str.strip() == lan_id]
-
         if not subset.empty:
             row = subset.sort_values("Notice Sent Date", ascending=False).iloc[0]
             summary = summarize_lan_record(row)
-
             st.write(f"**LAN ID:** {summary['lan_id']}")
             st.write(f"**Business:** {summary['business']}")
             st.write(f"**Current Legal Status:** {summary['current_legal_status']}")
@@ -258,15 +221,11 @@ if query:
             st.write(f"**Next Notice:** {summary['next_notice_name'] or 'N/A'} on {summary['next_notice_date'] or 'N/A'}")
         else:
             st.warning(f"No LAN record found for {lan_id}")
-    else:
+    elif qa_df is not None:
         contexts = retrieve(query, qa_df, qa_embeddings)
         if contexts:
-            st.text_area(
-                "Retrieved Context",
-                value="\n\n".join([f"Q: {c['Question']}\nA: {c['Answer']}" for c in contexts]),
-                height=250
-            )
+            st.text_area("Retrieved Context", value="\n\n".join([f"Q: {c['Question']}\nA: {c['Answer']}" for c in contexts]), height=250)
             answer_text = llm_answer(query, contexts)
             st.write("**Advocate Answer:**", answer_text)
         else:
-            st.warning("⚠️ No relevant QA embeddings found. Ensure QA data is valid and embeddings are built.")
+            st.warning("⚠️ No relevant QA embeddings found.")
